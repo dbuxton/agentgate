@@ -97,6 +97,87 @@ class AuditEvent:
 
 
 @dataclass
+class Role:
+    """
+    A named permission role for team-level access control.
+
+    Roles work like Profiles but are assigned to Teams rather than individual
+    users. When a user is a member of one or more teams, their effective
+    permissions are the UNION of their direct profile + all their team roles
+    (with explicit denied_tools always winning everywhere).
+
+    level: numeric priority (higher = more privileged). When a user is in
+    multiple teams with conflicting rate limits or token quotas, the most
+    restrictive non-zero limit wins (conservative by default).
+
+    Typical setup:
+      Role "admin"   — allowed=["*"],         level=100
+      Role "analyst" — allowed=["read_*"],    level=50
+      Role "intern"  — allowed=["search_*"],  level=10
+    """
+    id: str
+    name: str
+    description: str = ""
+    allowed_tools: List[str] = field(default_factory=lambda: ["*"])
+    denied_tools: List[str] = field(default_factory=list)
+    rate_limit_per_hour: int = 0
+    max_tokens_per_day: int = 0
+    level: int = 10
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    created_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class Team:
+    """
+    A named group of users sharing a common role.
+
+    Teams provide group-level permissions — create a team, assign a role,
+    add members, and everyone in the team inherits that role's permissions
+    (combined with their individual profile via union).
+
+    Example:
+      Team "engineering" → Role "admin"
+      Team "data-team"   → Role "analyst"
+      Team "contractors" → Role "intern"
+    """
+    id: str
+    name: str
+    description: str = ""
+    role_id: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    created_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class TeamMembership:
+    """A user's membership in a team."""
+    team_id: str
+    user_id: str
+    added_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class EffectivePermissions:
+    """
+    Resolved permissions for a user, merging their direct profile with all
+    team roles they belong to.
+
+    Union strategy:
+      - allowed_tools: UNION across profile + all team roles (most permissive)
+      - denied_tools:  UNION across profile + all team roles (any deny wins)
+      - rate_limit_per_hour: most restrictive non-zero (0 = unlimited)
+      - max_tokens_per_day:  most restrictive non-zero (0 = unlimited)
+    """
+    allowed_tools: List[str]
+    denied_tools: List[str]
+    rate_limit_per_hour: int
+    max_tokens_per_day: int
+    source_profile_id: Optional[str]
+    source_team_ids: List[str]
+
+
+@dataclass
 class EnforceRequest:
     """
     An enforcement check request: 'can this token call this tool?'

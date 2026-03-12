@@ -15,7 +15,7 @@ import uuid
 from contextlib import contextmanager
 from typing import Optional, List, Dict, Any
 
-from .models import Profile, User, SessionToken, AuditEvent
+from .models import Profile, User, SessionToken, AuditEvent, Role, Team, TeamMembership
 
 DEFAULT_DB_PATH = os.environ.get("AGENTGATE_DB", "agentgate.db")
 
@@ -102,10 +102,41 @@ class AgentGateDB:
                     PRIMARY KEY (user_id, window_key)
                 );
 
+                CREATE TABLE IF NOT EXISTS roles (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    description TEXT,
+                    allowed_tools TEXT NOT NULL DEFAULT '["*"]',
+                    denied_tools TEXT NOT NULL DEFAULT '[]',
+                    rate_limit_per_hour INTEGER NOT NULL DEFAULT 0,
+                    max_tokens_per_day INTEGER NOT NULL DEFAULT 0,
+                    level INTEGER NOT NULL DEFAULT 10,
+                    metadata TEXT NOT NULL DEFAULT '{}',
+                    created_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS teams (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    description TEXT,
+                    role_id TEXT NOT NULL REFERENCES roles(id),
+                    metadata TEXT NOT NULL DEFAULT '{}',
+                    created_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS team_members (
+                    team_id TEXT NOT NULL REFERENCES teams(id),
+                    user_id TEXT NOT NULL REFERENCES users(id),
+                    added_at REAL NOT NULL,
+                    PRIMARY KEY (team_id, user_id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_tokens_user ON session_tokens(user_id);
                 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id);
                 CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_users_external ON users(external_id);
+                CREATE INDEX IF NOT EXISTS idx_team_members_user ON team_members(user_id);
+                CREATE INDEX IF NOT EXISTS idx_team_members_team ON team_members(team_id);
             """)
 
     # ── Profiles ─────────────────────────────────────────────────────────────
@@ -456,6 +487,197 @@ class AgentGateDB:
                 (user_id, self._daily_key()),
             ).fetchone()
             return row["token_count"] if row else 0
+
+    # ── Roles ──────────────────────────────────────────────────────────────────
+
+    def create_role(
+        self,
+        name: str,
+        description: str = "",
+        allowed_tools: Optional[List[str]] = None,
+        denied_tools: Optional[List[str]] = None,
+        rate_limit_per_hour: int = 0,
+        max_tokens_per_day: int = 0,
+        level: int = 10,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Role:
+        role = Role(
+            id=str(uuid.uuid4()),
+            name=name,
+            description=description,
+            allowed_tools=allowed_tools or ["*"],
+            denied_tools=denied_tools or [],
+            rate_limit_per_hour=rate_limit_per_hour,
+            max_tokens_per_day=max_tokens_per_day,
+            level=level,
+            metadata=metadata or {},
+            created_at=time.time(),
+        )
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO roles
+                   (id, name, description, allowed_tools, denied_tools,
+                    rate_limit_per_hour, max_tokens_per_day, level, metadata, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    role.id, role.name, role.description,
+                    json.dumps(role.allowed_tools), json.dumps(role.denied_tools),
+                    role.rate_limit_per_hour, role.max_tokens_per_day,
+                    role.level, json.dumps(role.metadata), role.created_at,
+                ),
+            )
+        return role
+
+    def get_role(self, role_id: str) -> Optional[Role]:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM roles WHERE id=?", (role_id,)).fetchone()
+            return self._row_to_role(row) if row else None
+
+    def get_role_by_name(self, name: str) -> Optional[Role]:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM roles WHERE name=?", (name,)).fetchone()
+            return self._row_to_role(row) if row else None
+
+    def list_roles(self) -> List[Role]:
+        with self._conn() as conn:
+            rows = conn.execute("SELECT * FROM roles ORDER BY level DESC, name").fetchall()
+            return [self._row_to_role(r) for r in rows]
+
+    def _row_to_role(self, row) -> Role:
+        return Role(
+            id=row["id"],
+            name=row["name"],
+            description=row["description"] or "",
+            allowed_tools=json.loads(row["allowed_tools"]),
+            denied_tools=json.loads(row["denied_tools"]),
+            rate_limit_per_hour=row["rate_limit_per_hour"],
+            max_tokens_per_day=row["max_tokens_per_day"],
+            level=row["level"],
+            metadata=json.loads(row["metadata"]),
+            created_at=row["created_at"],
+        )
+
+    # ── Teams ──────────────────────────────────────────────────────────────────
+
+    def create_team(
+        self,
+        name: str,
+        role_id: str,
+        description: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Team:
+        team = Team(
+            id=str(uuid.uuid4()),
+            name=name,
+            description=description,
+            role_id=role_id,
+            metadata=metadata or {},
+            created_at=time.time(),
+        )
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO teams (id, name, description, role_id, metadata, created_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (team.id, team.name, team.description, team.role_id,
+                 json.dumps(team.metadata), team.created_at),
+            )
+        return team
+
+    def get_team(self, team_id: str) -> Optional[Team]:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM teams WHERE id=?", (team_id,)).fetchone()
+            return self._row_to_team(row) if row else None
+
+    def get_team_by_name(self, name: str) -> Optional[Team]:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM teams WHERE name=?", (name,)).fetchone()
+            return self._row_to_team(row) if row else None
+
+    def list_teams(self) -> List[Team]:
+        with self._conn() as conn:
+            rows = conn.execute("SELECT * FROM teams ORDER BY name").fetchall()
+            return [self._row_to_team(r) for r in rows]
+
+    def _row_to_team(self, row) -> Team:
+        return Team(
+            id=row["id"],
+            name=row["name"],
+            description=row["description"] or "",
+            role_id=row["role_id"],
+            metadata=json.loads(row["metadata"]),
+            created_at=row["created_at"],
+        )
+
+    # ── Team memberships ───────────────────────────────────────────────────────
+
+    def add_team_member(self, team_id: str, user_id: str) -> TeamMembership:
+        membership = TeamMembership(
+            team_id=team_id,
+            user_id=user_id,
+            added_at=time.time(),
+        )
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO team_members (team_id, user_id, added_at)
+                   VALUES (?,?,?)""",
+                (membership.team_id, membership.user_id, membership.added_at),
+            )
+        return membership
+
+    def remove_team_member(self, team_id: str, user_id: str) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM team_members WHERE team_id=? AND user_id=?",
+                (team_id, user_id),
+            )
+            return cur.rowcount > 0
+
+    def get_user_teams(self, user_id: str) -> List[Team]:
+        """Return all teams a user belongs to."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT t.* FROM teams t
+                   JOIN team_members m ON t.id = m.team_id
+                   WHERE m.user_id=?
+                   ORDER BY t.name""",
+                (user_id,),
+            ).fetchall()
+            return [self._row_to_team(r) for r in rows]
+
+    def get_team_members(self, team_id: str) -> List[User]:
+        """Return all users in a team."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT u.* FROM users u
+                   JOIN team_members m ON u.id = m.user_id
+                   WHERE m.team_id=? AND u.active=1
+                   ORDER BY u.name""",
+                (team_id,),
+            ).fetchall()
+            return [self._row_to_user(r) for r in rows]
+
+    def get_team_member_count(self, team_id: str) -> int:
+        with self._conn() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) as cnt FROM team_members m
+                   JOIN users u ON u.id = m.user_id
+                   WHERE m.team_id=? AND u.active=1""",
+                (team_id,),
+            ).fetchone()
+            return row["cnt"] if row else 0
+
+    def get_user_roles(self, user_id: str) -> List[Role]:
+        """Return all roles a user has via team memberships."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT r.* FROM roles r
+                   JOIN teams t ON t.role_id = r.id
+                   JOIN team_members m ON t.id = m.team_id
+                   WHERE m.user_id=?
+                   ORDER BY r.level DESC""",
+                (user_id,),
+            ).fetchall()
+            return [self._row_to_role(r) for r in rows]
 
     def get_usage_stats(self, user_id: str) -> Dict[str, Any]:
         """Usage summary for a user across available windows."""

@@ -292,3 +292,277 @@ class TestOffboarding:
         gate.revoke_user(user.id)
         with pytest.raises(ValueError, match="revoked"):
             gate.issue_token(user.id)
+
+
+# ── Team RBAC tests ───────────────────────────────────────────────────────────
+
+class TestRoles:
+    def test_create_role(self, db):
+        r = db.create_role(name="analyst", allowed_tools=["read_*"], level=50)
+        assert r.id
+        assert r.name == "analyst"
+        assert r.allowed_tools == ["read_*"]
+        assert r.level == 50
+
+    def test_role_roundtrip(self, db):
+        r = db.create_role(
+            name="senior",
+            allowed_tools=["crm_*", "read_*"],
+            denied_tools=["crm_delete_*"],
+            rate_limit_per_hour=100,
+            max_tokens_per_day=500000,
+            level=75,
+        )
+        fetched = db.get_role(r.id)
+        assert fetched.name == "senior"
+        assert fetched.denied_tools == ["crm_delete_*"]
+        assert fetched.level == 75
+
+    def test_get_role_by_name(self, db):
+        db.create_role(name="intern", allowed_tools=["search_*"], level=10)
+        r = db.get_role_by_name("intern")
+        assert r is not None
+        assert r.name == "intern"
+
+    def test_list_roles_ordered_by_level_desc(self, db):
+        db.create_role(name="junior", level=10)
+        db.create_role(name="senior", level=75)
+        db.create_role(name="admin", level=100)
+        roles = db.list_roles()
+        names = [r.name for r in roles]
+        assert names.index("admin") < names.index("senior") < names.index("junior")
+
+    def test_role_not_found(self, db):
+        assert db.get_role("nonexistent") is None
+
+
+class TestTeams:
+    @pytest.fixture
+    def role_analyst(self, db):
+        return db.create_role(name="analyst", allowed_tools=["read_*", "search_*"], level=50)
+
+    @pytest.fixture
+    def role_admin(self, db):
+        return db.create_role(name="admin", allowed_tools=["*"], level=100)
+
+    @pytest.fixture
+    def team_data(self, db, role_analyst):
+        return db.create_team(name="data-team", role_id=role_analyst.id, description="Data analysts")
+
+    def test_create_team(self, db, role_analyst):
+        t = db.create_team(name="alpha", role_id=role_analyst.id)
+        assert t.id
+        assert t.name == "alpha"
+        assert t.role_id == role_analyst.id
+
+    def test_get_team_by_name(self, db, role_analyst):
+        db.create_team(name="beta-team", role_id=role_analyst.id)
+        t = db.get_team_by_name("beta-team")
+        assert t is not None
+        assert t.name == "beta-team"
+
+    def test_add_and_remove_member(self, db, profile, role_analyst):
+        team = db.create_team(name="eng", role_id=role_analyst.id)
+        u = db.create_user(name="Charlie", email="charlie@x.com", profile_id=profile.id)
+        db.add_team_member(team_id=team.id, user_id=u.id)
+
+        members = db.get_team_members(team.id)
+        assert any(m.id == u.id for m in members)
+
+        ok = db.remove_team_member(team_id=team.id, user_id=u.id)
+        assert ok
+        assert db.get_team_member_count(team.id) == 0
+
+    def test_add_member_idempotent(self, db, profile, role_analyst):
+        team = db.create_team(name="ops", role_id=role_analyst.id)
+        u = db.create_user(name="Dana", email="dana@x.com", profile_id=profile.id)
+        db.add_team_member(team_id=team.id, user_id=u.id)
+        db.add_team_member(team_id=team.id, user_id=u.id)  # second add — should not raise
+        assert db.get_team_member_count(team.id) == 1
+
+    def test_get_user_teams(self, db, profile, role_analyst, role_admin):
+        t1 = db.create_team(name="engineering", role_id=role_admin.id)
+        t2 = db.create_team(name="data", role_id=role_analyst.id)
+        u = db.create_user(name="Eve", email="eve@x.com", profile_id=profile.id)
+        db.add_team_member(team_id=t1.id, user_id=u.id)
+        db.add_team_member(team_id=t2.id, user_id=u.id)
+
+        user_teams = db.get_user_teams(u.id)
+        team_names = [t.name for t in user_teams]
+        assert "engineering" in team_names
+        assert "data" in team_names
+
+    def test_get_user_roles(self, db, profile, role_analyst, role_admin):
+        t1 = db.create_team(name="eng2", role_id=role_admin.id)
+        t2 = db.create_team(name="dat2", role_id=role_analyst.id)
+        u = db.create_user(name="Frank", email="frank@x.com", profile_id=profile.id)
+        db.add_team_member(t1.id, u.id)
+        db.add_team_member(t2.id, u.id)
+
+        user_roles = db.get_user_roles(u.id)
+        role_names = [r.name for r in user_roles]
+        assert "admin" in role_names
+        assert "analyst" in role_names
+        # Ordered by level DESC — admin (100) first
+        assert user_roles[0].name == "admin"
+
+
+class TestTeamRBAC:
+    """
+    Test the effective permissions resolution — the core of team RBAC.
+    Union strategy: allowed = union of profile + team roles; denied = union of all denies.
+    """
+
+    @pytest.fixture
+    def basic_profile(self, db):
+        return db.create_profile(
+            name="base",
+            allowed_tools=["crm_*"],
+            denied_tools=[],
+        )
+
+    @pytest.fixture
+    def role_analytics(self, db):
+        return db.create_role(
+            name="analytics",
+            allowed_tools=["analytics_*", "reports_*"],
+            denied_tools=[],
+            level=50,
+        )
+
+    @pytest.fixture
+    def role_restrictive(self, db):
+        return db.create_role(
+            name="restricted",
+            allowed_tools=["*"],
+            denied_tools=["payments_*"],  # team denies payment tools
+            level=10,
+        )
+
+    def test_effective_permissions_no_teams(self, db, gate, basic_profile):
+        """User with no team memberships — perms come entirely from their profile."""
+        u = db.create_user(name="Solo", email="solo@x.com", profile_id=basic_profile.id)
+        perms = gate.resolve_effective_permissions(u)
+        assert perms.allowed_tools == ["crm_*"]
+        assert perms.denied_tools == []
+        assert perms.source_team_ids == []
+
+    def test_team_role_expands_allowed_tools(self, db, gate, basic_profile, role_analytics):
+        """User in a team gets union of profile + team role allowed tools."""
+        team = db.create_team(name="analytics-team", role_id=role_analytics.id)
+        u = db.create_user(name="Grace", email="grace@x.com", profile_id=basic_profile.id)
+        db.add_team_member(team_id=team.id, user_id=u.id)
+
+        perms = gate.resolve_effective_permissions(u)
+        # Should have crm_* from profile AND analytics_*, reports_* from team role
+        assert "crm_*" in perms.allowed_tools
+        assert "analytics_*" in perms.allowed_tools
+        assert "reports_*" in perms.allowed_tools
+
+    def test_team_deny_propagates(self, db, gate, basic_profile, role_restrictive):
+        """A deny in ANY team role applies globally — any deny wins."""
+        team = db.create_team(name="restricted-team", role_id=role_restrictive.id)
+        u = db.create_user(name="Hank", email="hank@x.com", profile_id=basic_profile.id)
+        db.add_team_member(team_id=team.id, user_id=u.id)
+
+        perms = gate.resolve_effective_permissions(u)
+        assert "payments_*" in perms.denied_tools
+
+    def test_enforce_with_team_expanded_tools(self, db, gate, basic_profile, role_analytics):
+        """User can call analytics_get_report even though their profile doesn't include it
+        (the team role grants it)."""
+        team = db.create_team(name="analytics2", role_id=role_analytics.id)
+        u = db.create_user(name="Iris", email="iris@x.com", profile_id=basic_profile.id)
+        db.add_team_member(team_id=team.id, user_id=u.id)
+        token = gate.issue_token(u.id)
+
+        # Profile alone wouldn't allow this
+        result = gate.enforce(EnforceRequest(token=token.token, tool_name="analytics_get_report"))
+        assert result.granted, f"Expected granted, got deny: {result.deny_reason}"
+
+        # Profile tools still work too
+        result2 = gate.enforce(EnforceRequest(token=token.token, tool_name="crm_get_contact"))
+        assert result2.granted
+
+    def test_enforce_team_deny_blocks_tool(self, db, gate, basic_profile, role_restrictive):
+        """Team deny blocks payment tools even though the team role's allowed_tools includes *."""
+        team = db.create_team(name="no-pay-team", role_id=role_restrictive.id)
+        u = db.create_user(name="Jack", email="jack@x.com", profile_id=basic_profile.id)
+        db.add_team_member(team_id=team.id, user_id=u.id)
+        token = gate.issue_token(u.id)
+
+        result = gate.enforce(EnforceRequest(token=token.token, tool_name="payments_send"))
+        assert not result.granted
+        assert result.deny_reason == "tool_explicitly_denied"
+
+    def test_most_restrictive_rate_limit(self, db, gate):
+        """When user profile has rate_limit=10 and team role has rate_limit=5,
+        effective limit is 5 (more restrictive)."""
+        profile = db.create_profile(
+            name="rate10", allowed_tools=["*"], rate_limit_per_hour=10
+        )
+        role = db.create_role(
+            name="rate5-role", allowed_tools=["*"], rate_limit_per_hour=5
+        )
+        team = db.create_team(name="capped-team", role_id=role.id)
+        u = db.create_user(name="Kate", email="kate@x.com", profile_id=profile.id)
+        db.add_team_member(team_id=team.id, user_id=u.id)
+        token = gate.issue_token(u.id)
+
+        perms = gate.resolve_effective_permissions(u)
+        assert perms.rate_limit_per_hour == 5  # most restrictive
+
+        # 5 calls succeed, 6th is denied
+        for _ in range(5):
+            r = gate.enforce(EnforceRequest(token=token.token, tool_name="anything"))
+            assert r.granted
+
+        r6 = gate.enforce(EnforceRequest(token=token.token, tool_name="anything"))
+        assert not r6.granted
+        assert r6.deny_reason == "rate_limit_exceeded"
+
+    def test_multiple_team_memberships_union(self, db, gate):
+        """User in two teams gets the union of all team role allowed_tools."""
+        profile = db.create_profile(name="base2", allowed_tools=["base_*"])
+        role1 = db.create_role(name="r1", allowed_tools=["alpha_*"])
+        role2 = db.create_role(name="r2", allowed_tools=["beta_*"])
+        t1 = db.create_team(name="team-alpha", role_id=role1.id)
+        t2 = db.create_team(name="team-beta", role_id=role2.id)
+        u = db.create_user(name="Leo", email="leo@x.com", profile_id=profile.id)
+        db.add_team_member(t1.id, u.id)
+        db.add_team_member(t2.id, u.id)
+
+        perms = gate.resolve_effective_permissions(u)
+        assert "base_*" in perms.allowed_tools
+        assert "alpha_*" in perms.allowed_tools
+        assert "beta_*" in perms.allowed_tools
+        assert len(perms.source_team_ids) == 2
+
+    def test_no_rate_limit_if_no_sources_set(self, db, gate):
+        """If neither profile nor team roles set rate limits, effective limit is 0 (unlimited)."""
+        profile = db.create_profile(name="free", allowed_tools=["*"], rate_limit_per_hour=0)
+        role = db.create_role(name="free-role", allowed_tools=["*"], rate_limit_per_hour=0)
+        team = db.create_team(name="free-team", role_id=role.id)
+        u = db.create_user(name="Max", email="max@x.com", profile_id=profile.id)
+        db.add_team_member(team.id, u.id)
+
+        perms = gate.resolve_effective_permissions(u)
+        assert perms.rate_limit_per_hour == 0  # 0 means unlimited
+
+    def test_team_removal_removes_permissions(self, db, gate, basic_profile, role_analytics):
+        """After removing user from team, they lose the team's extra permissions."""
+        team = db.create_team(name="temp-team", role_id=role_analytics.id)
+        u = db.create_user(name="Nina", email="nina@x.com", profile_id=basic_profile.id)
+        db.add_team_member(team_id=team.id, user_id=u.id)
+
+        # Can access analytics tools
+        perms_before = gate.resolve_effective_permissions(u)
+        assert "analytics_*" in perms_before.allowed_tools
+
+        # Remove from team
+        db.remove_team_member(team_id=team.id, user_id=u.id)
+
+        # Analytics tools gone
+        perms_after = gate.resolve_effective_permissions(u)
+        assert "analytics_*" not in perms_after.allowed_tools
+        assert "crm_*" in perms_after.allowed_tools  # profile tools still there

@@ -5,10 +5,13 @@
 When you deploy AI agents to many users, each person should have an access profile defining which tools their agent can use. agentgate is the enforcement layer: users get profiles, sessions get signed tokens, every tool call is checked against the user's profile, and access can be revoked instantly.
 
 ```
-Alice (HR Manager)  → profile:hr-manager  → can use: crm_*, email_*, hr_*
-Bob (Sales Rep)     → profile:sales        → can use: crm_read_*, email_*
-Carol (IT Admin)    → profile:admin        → can use: *  (but not delete_*)
-Dave (ex-employee)  → REVOKED             → immediate denial on all sessions
+Alice (HR Manager)  → profile:hr-manager + team:hr-dept (role:manager)
+                    → effective: crm_*, email_*, hr_*, reports_*
+Bob (Sales Rep)     → profile:sales + team:sales-team (role:sales)
+                    → effective: crm_read_*, email_*, dialer_*
+Carol (IT Admin)    → profile:base + team:engineering (role:admin)
+                    → effective: *  (but not delete_* — profile deny wins)
+Dave (ex-employee)  → REVOKED → immediate denial on all sessions
 ```
 
 ## The problem
@@ -74,12 +77,15 @@ Agent makes tool call
         ├─ Verify token signature + expiry
         ├─ Check token not revoked
         ├─ Check user still active  ← catches post-issuance offboardings
-        ├─ Match tool against profile allowlist/denylist
-        ├─ Check hourly rate limit
-        └─ Check daily token quota
+        ├─ Resolve effective permissions:
+        │    user.profile + all team roles → union of allowed, union of denied
+        │    rate_limit / quota → most restrictive non-zero
+        ├─ Match tool against effective allowlist/denylist
+        ├─ Check effective hourly rate limit
+        └─ Check effective daily token quota
         │
         ▼
-  GRANT → increment counters, log event
+  GRANT → increment counters, log event (includes source team_ids)
   DENY  → log event, return deny_reason
 ```
 
@@ -90,11 +96,11 @@ The key insight: **user.active** is checked on every enforce call, not just at t
 ```
 agentgate/
   db.py            — SQLite store (WAL mode, all queries here)
-  models.py        — Profile, User, SessionToken, AuditEvent
+  models.py        — Profile, User, SessionToken, AuditEvent, Role, Team, TeamMembership
   tokens.py        — HMAC-SHA256 token signing (no JWT lib needed)
-  gate.py          — AgentGate enforcement engine
-  server.py        — FastAPI server + dark-mode dashboard
-  cli.py           — Full CLI (profile/user/token/enforce/audit/usage)
+  gate.py          — AgentGate: enforcement + resolve_effective_permissions()
+  server.py        — FastAPI server + dark-mode dashboard (teams/roles sections)
+  cli.py           — Full CLI (profile/role/team/user/token/enforce/audit/usage)
   integrations/
     django_adapter.py  — AgentProfile model, middleware, decorator
     openai_wrapper.py  — GatedOpenAI + GatedAnthropic wrappers
@@ -118,6 +124,87 @@ agentgate profile create --name free-tier \
   --allowed "chat_*" \
   --rate 20 \
   --tokens 50000
+```
+
+## Team RBAC
+
+Profiles handle per-user overrides. Teams handle org-level role assignment — create a role once, assign it to a team, and every user in that team inherits those permissions.
+
+```bash
+# 1. Create roles (named permission sets for groups)
+agentgate role create --name admin    --allowed "*"                         --level 100
+agentgate role create --name analyst  --allowed "read_*,reports_*,search_*" --level 50
+agentgate role create --name intern   --allowed "search_*"                  --level 10
+
+# 2. Create teams with a role
+agentgate team create --name engineering  --role admin
+agentgate team create --name data-team   --role analyst
+agentgate team create --name contractors --role intern
+
+# 3. Add users to teams
+agentgate team add-member engineering   --user alice@acme.com
+agentgate team add-member data-team     --user bob@acme.com
+agentgate team add-member data-team     --user carol@acme.com
+
+# 4. See what a user's effective permissions look like (profile + all team roles merged)
+agentgate user permissions alice@acme.com
+# → Sources:
+#     profile:  employee
+#     team:     engineering → role: admin
+# → Effective allowed_tools:  crm_*, email_*, *
+# → Effective denied_tools:   crm_delete_*
+# → Effective rate_limit:     ∞
+# → Effective token_quota:    ∞
+```
+
+**Permission resolution (union model):**
+- `allowed_tools` = UNION of profile + all team roles (most permissive)
+- `denied_tools` = UNION of profile + all team roles (**any deny wins**)
+- `rate_limit` / `token_quota` = most restrictive non-zero value wins (safe default)
+
+This is Django's group permission model: teams GRANT additional access, but explicit denies from anywhere always apply.
+
+```python
+# Team RBAC in Python
+from agentgate import AgentGateDB, AgentGate
+
+db = AgentGateDB("agentgate.db")
+gate = AgentGate(db=db, token_manager=tm)
+
+# Create role + team
+role = db.create_role(name="analyst", allowed_tools=["reports_*", "read_*"], level=50)
+team = db.create_team(name="data-team", role_id=role.id)
+
+# Add user to team
+db.add_team_member(team_id=team.id, user_id=user.id)
+
+# Inspect effective permissions
+perms = gate.resolve_effective_permissions(user)
+# perms.allowed_tools → union of user profile + all team roles
+# perms.denied_tools  → any deny from any source
+# perms.source_team_ids → which teams contributed
+
+# Enforcement automatically uses effective permissions
+result = gate.enforce(EnforceRequest(token=token.token, tool_name="reports_get"))
+# → granted: True  (team role grants reports_* even if user profile doesn't)
+```
+
+### Team API endpoints
+
+```
+POST   /roles                      — create role
+GET    /roles                      — list roles
+GET    /roles/{id}                 — get role
+
+POST   /teams                      — create team
+GET    /teams                      — list teams (includes member count)
+GET    /teams/{id}                 — get team
+GET    /teams/{id}/members         — list team members
+POST   /teams/{id}/members         — add member
+DELETE /teams/{id}/members/{uid}   — remove member
+
+GET    /users/{id}/teams           — get user's team memberships
+GET    /users/{id}/permissions     — resolved effective permissions
 ```
 
 ## API server

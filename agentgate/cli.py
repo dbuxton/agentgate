@@ -7,11 +7,24 @@ Usage:
   agentgate profile list
   agentgate profile get <name_or_id>
 
+  agentgate role create --name "analyst" --allowed "read_*" --level 50
+  agentgate role list
+  agentgate role get <name_or_id>
+
+  agentgate team create --name "engineering" --role "admin"
+  agentgate team list
+  agentgate team get <name_or_id>
+  agentgate team members <name_or_id>
+  agentgate team add-member <team_name_or_id> --user <email_or_id>
+  agentgate team remove-member <team_name_or_id> --user <email_or_id>
+
   agentgate user create --name "Alice" --email alice@acme.com --profile "employee"
   agentgate user list
   agentgate user get <id_or_email>
   agentgate user revoke <id_or_email>     # offboard — kills all sessions instantly
   agentgate user profile <id> --set <profile_name>
+  agentgate user teams <id_or_email>
+  agentgate user permissions <id_or_email>
 
   agentgate token issue --user <id_or_email> [--conversation <id>] [--ttl 3600]
   agentgate token revoke <token_id>
@@ -73,6 +86,28 @@ def resolve_profile(db, ref):
     return p
 
 
+def resolve_role(db, ref):
+    """Find role by id or name."""
+    r = db.get_role(ref)
+    if not r:
+        r = db.get_role_by_name(ref)
+    if not r:
+        print(f"✗ Role not found: {ref!r}", file=sys.stderr)
+        sys.exit(1)
+    return r
+
+
+def resolve_team(db, ref):
+    """Find team by id or name."""
+    t = db.get_team(ref)
+    if not t:
+        t = db.get_team_by_name(ref)
+    if not t:
+        print(f"✗ Team not found: {ref!r}", file=sys.stderr)
+        sys.exit(1)
+    return t
+
+
 # ── profile ───────────────────────────────────────────────────────────────────
 
 def cmd_profile_create(args):
@@ -121,6 +156,138 @@ def cmd_profile_get(args):
         "rate_limit_per_hour": p.rate_limit_per_hour, "max_tokens_per_day": p.max_tokens_per_day,
         "created_at": fmt_ts(p.created_at),
     }, indent=2))
+
+
+# ── role ──────────────────────────────────────────────────────────────────────
+
+def cmd_role_create(args):
+    db = get_db()
+    allowed = [t.strip() for t in (args.allowed or "*").split(",") if t.strip()]
+    denied = [t.strip() for t in (args.denied or "").split(",") if t.strip()]
+    r = db.create_role(
+        name=args.name,
+        description=args.description or "",
+        allowed_tools=allowed,
+        denied_tools=denied,
+        rate_limit_per_hour=args.rate or 0,
+        max_tokens_per_day=args.tokens or 0,
+        level=args.level or 10,
+    )
+    print(f"✅ Role created")
+    print(f"   id:            {r.id}")
+    print(f"   name:          {r.name}")
+    print(f"   level:         {r.level}")
+    print(f"   allowed_tools: {', '.join(r.allowed_tools)}")
+    print(f"   denied_tools:  {', '.join(r.denied_tools) or '—'}")
+    print(f"   rate_limit:    {'∞' if not r.rate_limit_per_hour else str(r.rate_limit_per_hour) + '/hr'}")
+    print(f"   token_quota:   {'∞' if not r.max_tokens_per_day else str(r.max_tokens_per_day) + '/day'}")
+
+
+def cmd_role_list(args):
+    db = get_db()
+    roles = db.list_roles()
+    if not roles:
+        print("No roles.")
+        return
+    print(f"{'NAME':<20} {'LEVEL':<8} {'ALLOWED':<25} {'DENIED':<20} {'ID'}")
+    print("-" * 90)
+    for r in roles:
+        allowed = ', '.join(r.allowed_tools)[:23]
+        denied = ', '.join(r.denied_tools)[:18] or "—"
+        print(f"{r.name:<20} {r.level:<8} {allowed:<25} {denied:<20} {r.id[:8]}")
+
+
+def cmd_role_get(args):
+    db = get_db()
+    r = resolve_role(db, args.ref)
+    print(json.dumps({
+        "id": r.id, "name": r.name, "description": r.description,
+        "level": r.level,
+        "allowed_tools": r.allowed_tools, "denied_tools": r.denied_tools,
+        "rate_limit_per_hour": r.rate_limit_per_hour, "max_tokens_per_day": r.max_tokens_per_day,
+        "created_at": fmt_ts(r.created_at),
+    }, indent=2))
+
+
+# ── team ──────────────────────────────────────────────────────────────────────
+
+def cmd_team_create(args):
+    db = get_db()
+    role = resolve_role(db, args.role)
+    team = db.create_team(
+        name=args.name,
+        role_id=role.id,
+        description=args.description or "",
+    )
+    print(f"✅ Team created")
+    print(f"   id:          {team.id}")
+    print(f"   name:        {team.name}")
+    print(f"   role:        {role.name} ({role.id[:8]})")
+    print(f"   created_at:  {fmt_ts(team.created_at)}")
+
+
+def cmd_team_list(args):
+    db = get_db()
+    teams = db.list_teams()
+    if not teams:
+        print("No teams.")
+        return
+    print(f"{'NAME':<25} {'ROLE':<20} {'MEMBERS':<10} {'DESCRIPTION':<30} {'ID'}")
+    print("-" * 105)
+    for t in teams:
+        role = db.get_role(t.role_id)
+        rname = role.name if role else t.role_id[:8]
+        count = db.get_team_member_count(t.id)
+        desc = (t.description or "—")[:28]
+        print(f"{t.name:<25} {rname:<20} {count:<10} {desc:<30} {t.id[:8]}")
+
+
+def cmd_team_get(args):
+    db = get_db()
+    t = resolve_team(db, args.ref)
+    role = db.get_role(t.role_id)
+    members = db.get_team_members(t.id)
+    print(json.dumps({
+        "id": t.id, "name": t.name, "description": t.description,
+        "role_id": t.role_id,
+        "role_name": role.name if role else None,
+        "member_count": len(members),
+        "members": [{"id": u.id[:8], "name": u.name, "email": u.email} for u in members],
+        "created_at": fmt_ts(t.created_at),
+    }, indent=2))
+
+
+def cmd_team_members(args):
+    db = get_db()
+    t = resolve_team(db, args.ref)
+    members = db.get_team_members(t.id)
+    if not members:
+        print(f"Team {t.name!r} has no members.")
+        return
+    print(f"Members of team {t.name!r} ({len(members)}):")
+    print(f"{'NAME':<25} {'EMAIL':<30} {'ID'}")
+    print("-" * 75)
+    for u in members:
+        print(f"{u.name:<25} {u.email:<30} {u.id[:8]}")
+
+
+def cmd_team_add_member(args):
+    db = get_db()
+    team = resolve_team(db, args.ref)
+    user = resolve_user(db, args.user)
+    db.add_team_member(team_id=team.id, user_id=user.id)
+    print(f"✅ {user.name} ({user.email}) added to team {team.name!r}")
+
+
+def cmd_team_remove_member(args):
+    db = get_db()
+    team = resolve_team(db, args.ref)
+    user = resolve_user(db, args.user)
+    ok = db.remove_team_member(team_id=team.id, user_id=user.id)
+    if ok:
+        print(f"✅ {user.name} removed from team {team.name!r}")
+    else:
+        print(f"⚠️  {user.name} is not a member of team {team.name!r}")
 
 
 # ── user ──────────────────────────────────────────────────────────────────────
@@ -195,6 +362,49 @@ def cmd_user_set_profile(args):
     profile = resolve_profile(db, args.set)
     ok = db.update_user_profile(user.id, profile.id)
     print(f"{'✅' if ok else '✗'} Profile updated: {user.name} → {profile.name}")
+
+
+def cmd_user_teams(args):
+    db = get_db()
+    user = resolve_user(db, args.ref)
+    teams = db.get_user_teams(user.id)
+    if not teams:
+        print(f"{user.name} is not in any teams.")
+        return
+    print(f"Teams for {user.name} ({user.email}):")
+    print(f"{'TEAM':<25} {'ROLE':<20} {'ID'}")
+    print("-" * 65)
+    for t in teams:
+        role = db.get_role(t.role_id)
+        rname = role.name if role else t.role_id[:8]
+        print(f"{t.name:<25} {rname:<20} {t.id[:8]}")
+
+
+def cmd_user_permissions(args):
+    db = get_db()
+    gate = get_gate(db)
+    user = resolve_user(db, args.ref)
+    perms = gate.resolve_effective_permissions(user)
+    teams = db.get_user_teams(user.id)
+    profile = db.get_profile(user.profile_id)
+
+    print(f"Effective permissions for {user.name} ({user.email}):")
+    print(f"")
+    print(f"  Sources:")
+    print(f"    profile:  {profile.name if profile else '—'}")
+    if teams:
+        for t in teams:
+            role = db.get_role(t.role_id)
+            print(f"    team:     {t.name} → role: {role.name if role else '?'}")
+    else:
+        print(f"    teams:    (none)")
+    print(f"")
+    print(f"  Effective allowed_tools:  {', '.join(perms.allowed_tools)}")
+    print(f"  Effective denied_tools:   {', '.join(perms.denied_tools) or '—'}")
+    rate = f"{perms.rate_limit_per_hour}/hr" if perms.rate_limit_per_hour else "∞"
+    quota = f"{perms.max_tokens_per_day:,}/day" if perms.max_tokens_per_day else "∞"
+    print(f"  Effective rate_limit:     {rate}")
+    print(f"  Effective token_quota:    {quota}")
 
 
 # ── token ─────────────────────────────────────────────────────────────────────
@@ -340,6 +550,33 @@ def main():
     ps.add_parser("list")
     pg = ps.add_parser("get"); pg.add_argument("ref")
 
+    # role
+    p_role = sub.add_parser("role", help="Manage roles (team-level permissions)")
+    rs = p_role.add_subparsers(dest="subcommand")
+    rc = rs.add_parser("create")
+    rc.add_argument("--name", required=True)
+    rc.add_argument("--description", default="")
+    rc.add_argument("--allowed", default="*", help="Comma-separated tool globs (default: *)")
+    rc.add_argument("--denied", default="", help="Comma-separated denied tool globs")
+    rc.add_argument("--rate", type=int, default=0, help="Max tool calls per hour (0=unlimited)")
+    rc.add_argument("--tokens", type=int, default=0, help="Max LLM tokens per day (0=unlimited)")
+    rc.add_argument("--level", type=int, default=10, help="Priority level (higher = more privileged)")
+    rs.add_parser("list")
+    rg = rs.add_parser("get"); rg.add_argument("ref")
+
+    # team
+    p_team = sub.add_parser("team", help="Manage teams")
+    tms = p_team.add_subparsers(dest="subcommand")
+    tc = tms.add_parser("create")
+    tc.add_argument("--name", required=True)
+    tc.add_argument("--role", required=True, help="Role name or id")
+    tc.add_argument("--description", default="")
+    tms.add_parser("list")
+    tg = tms.add_parser("get"); tg.add_argument("ref")
+    tmem = tms.add_parser("members"); tmem.add_argument("ref")
+    tam = tms.add_parser("add-member"); tam.add_argument("ref"); tam.add_argument("--user", required=True)
+    trm = tms.add_parser("remove-member"); trm.add_argument("ref"); trm.add_argument("--user", required=True)
+
     # user
     p_user = sub.add_parser("user", help="Manage users")
     us = p_user.add_subparsers(dest="subcommand")
@@ -352,6 +589,8 @@ def main():
     ug = us.add_parser("get"); ug.add_argument("ref")
     ur = us.add_parser("revoke"); ur.add_argument("ref")
     up = us.add_parser("profile"); up.add_argument("ref"); up.add_argument("--set", required=True)
+    ute = us.add_parser("teams"); ute.add_argument("ref")
+    uperms = us.add_parser("permissions"); uperms.add_argument("ref")
 
     # token
     p_token = sub.add_parser("token", help="Manage session tokens")
@@ -389,11 +628,22 @@ def main():
         ("profile", "create"): cmd_profile_create,
         ("profile", "list"): cmd_profile_list,
         ("profile", "get"): cmd_profile_get,
+        ("role", "create"): cmd_role_create,
+        ("role", "list"): cmd_role_list,
+        ("role", "get"): cmd_role_get,
+        ("team", "create"): cmd_team_create,
+        ("team", "list"): cmd_team_list,
+        ("team", "get"): cmd_team_get,
+        ("team", "members"): cmd_team_members,
+        ("team", "add-member"): cmd_team_add_member,
+        ("team", "remove-member"): cmd_team_remove_member,
         ("user", "create"): cmd_user_create,
         ("user", "list"): cmd_user_list,
         ("user", "get"): cmd_user_get,
         ("user", "revoke"): cmd_user_revoke,
         ("user", "profile"): cmd_user_set_profile,
+        ("user", "teams"): cmd_user_teams,
+        ("user", "permissions"): cmd_user_permissions,
         ("token", "issue"): cmd_token_issue,
         ("token", "revoke"): cmd_token_revoke,
         ("token", "inspect"): cmd_token_inspect,

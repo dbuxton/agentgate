@@ -22,7 +22,10 @@ import fnmatch
 from typing import Optional, Dict, Any
 
 from .db import AgentGateDB
-from .models import EnforceRequest, EnforceResult, User, Profile, SessionToken
+from .models import (
+    EnforceRequest, EnforceResult, User, Profile, SessionToken,
+    Role, EffectivePermissions,
+)
 from .tokens import TokenManager
 
 
@@ -30,6 +33,61 @@ class AgentGate:
     def __init__(self, db: AgentGateDB, token_manager: TokenManager):
         self.db = db
         self.tm = token_manager
+
+    # ── Effective permissions ─────────────────────────────────────────────────
+
+    def resolve_effective_permissions(self, user: User) -> EffectivePermissions:
+        """
+        Compute the user's effective permissions by merging their direct profile
+        with all team roles they belong to.
+
+        Union strategy (Django-style):
+          - allowed_tools: UNION across profile + all team roles
+            (a tool is allowed if ANY source allows it)
+          - denied_tools:  UNION across profile + all team roles
+            (a tool is denied if ANY source denies it — denies always win)
+          - rate_limit_per_hour: most restrictive non-zero (0 = unlimited)
+          - max_tokens_per_day:  most restrictive non-zero (0 = unlimited)
+
+        This means teams can GRANT additional tools (expand access) while
+        explicit denies from any source always apply.
+        """
+        profile = self.db.get_profile(user.profile_id)
+        team_roles = self.db.get_user_roles(user.id)
+        teams = self.db.get_user_teams(user.id)
+
+        # Aggregate allowed/denied from all sources
+        all_allowed: list = list(profile.allowed_tools) if profile else ["*"]
+        all_denied: list = list(profile.denied_tools) if profile else []
+
+        for role in team_roles:
+            for pat in role.allowed_tools:
+                if pat not in all_allowed:
+                    all_allowed.append(pat)
+            for pat in role.denied_tools:
+                if pat not in all_denied:
+                    all_denied.append(pat)
+
+        # Rate limits: most restrictive non-zero wins
+        rate_sources = [profile.rate_limit_per_hour] if profile and profile.rate_limit_per_hour > 0 else []
+        quota_sources = [profile.max_tokens_per_day] if profile and profile.max_tokens_per_day > 0 else []
+        for role in team_roles:
+            if role.rate_limit_per_hour > 0:
+                rate_sources.append(role.rate_limit_per_hour)
+            if role.max_tokens_per_day > 0:
+                quota_sources.append(role.max_tokens_per_day)
+
+        effective_rate = min(rate_sources) if rate_sources else 0
+        effective_quota = min(quota_sources) if quota_sources else 0
+
+        return EffectivePermissions(
+            allowed_tools=all_allowed,
+            denied_tools=all_denied,
+            rate_limit_per_hour=effective_rate,
+            max_tokens_per_day=effective_quota,
+            source_profile_id=profile.id if profile else None,
+            source_team_ids=[t.id for t in teams],
+        )
 
     # ── Token lifecycle ───────────────────────────────────────────────────────
 
@@ -115,27 +173,30 @@ class AgentGate:
         if not token.is_valid:
             return self._deny("token_expired", request, token)
 
-        # 4. Load profile
-        profile = self.db.get_profile(token.profile_id)
-        if not profile:
+        # 4. Resolve effective permissions (profile + team roles)
+        perms = self.resolve_effective_permissions(user)
+        if not perms.allowed_tools and not perms.source_profile_id:
             return self._deny("profile_not_found", request, token)
 
-        # 5. Tool allow/deny matching
-        if not self._tool_allowed(request.tool_name, profile):
+        # Load the direct profile for logging (may be None if only team roles)
+        profile = self.db.get_profile(user.profile_id) if user.profile_id else None
+
+        # 5. Tool allow/deny matching against EFFECTIVE permissions
+        if not self._tool_allowed_perms(request.tool_name, perms):
             return self._deny("tool_not_allowed", request, token, profile, user)
-        if self._tool_denied(request.tool_name, profile):
+        if self._tool_denied_perms(request.tool_name, perms):
             return self._deny("tool_explicitly_denied", request, token, profile, user)
 
-        # 6. Rate limiting (per hour)
-        if profile.rate_limit_per_hour > 0:
+        # 6. Rate limiting (per hour) — most restrictive across profile + teams
+        if perms.rate_limit_per_hour > 0:
             hourly_calls = self.db.get_hourly_tool_calls(user.id)
-            if hourly_calls >= profile.rate_limit_per_hour:
+            if hourly_calls >= perms.rate_limit_per_hour:
                 return self._deny("rate_limit_exceeded", request, token, profile, user)
 
-        # 7. Daily token quota
-        if profile.max_tokens_per_day > 0 and request.token_count > 0:
+        # 7. Daily token quota — most restrictive across profile + teams
+        if perms.max_tokens_per_day > 0 and request.token_count > 0:
             daily_tokens = self.db.get_daily_tokens(user.id)
-            if daily_tokens + request.token_count > profile.max_tokens_per_day:
+            if daily_tokens + request.token_count > perms.max_tokens_per_day:
                 return self._deny("daily_token_quota_exceeded", request, token, profile, user)
 
         # ✅ GRANT
@@ -147,16 +208,17 @@ class AgentGate:
             tool_name=request.tool_name,
             granted=True,
             conversation_id=token.conversation_id,
-            profile_id=profile.id,
+            profile_id=profile.id if profile else None,
+            metadata={"team_ids": perms.source_team_ids} if perms.source_team_ids else {},
         )
 
         # Compute remaining headroom
         rate_remaining: Optional[int] = None
         tokens_remaining: Optional[int] = None
-        if profile.rate_limit_per_hour > 0:
-            rate_remaining = max(0, profile.rate_limit_per_hour - self.db.get_hourly_tool_calls(user.id))
-        if profile.max_tokens_per_day > 0:
-            tokens_remaining = max(0, profile.max_tokens_per_day - self.db.get_daily_tokens(user.id))
+        if perms.rate_limit_per_hour > 0:
+            rate_remaining = max(0, perms.rate_limit_per_hour - self.db.get_hourly_tool_calls(user.id))
+        if perms.max_tokens_per_day > 0:
+            tokens_remaining = max(0, perms.max_tokens_per_day - self.db.get_daily_tokens(user.id))
 
         return EnforceResult(
             granted=True,
@@ -198,3 +260,9 @@ class AgentGate:
 
     def _tool_denied(self, tool_name: str, profile: Profile) -> bool:
         return any(fnmatch.fnmatch(tool_name, pattern) for pattern in profile.denied_tools)
+
+    def _tool_allowed_perms(self, tool_name: str, perms: "EffectivePermissions") -> bool:
+        return any(fnmatch.fnmatch(tool_name, pat) for pat in perms.allowed_tools)
+
+    def _tool_denied_perms(self, tool_name: str, perms: "EffectivePermissions") -> bool:
+        return any(fnmatch.fnmatch(tool_name, pat) for pat in perms.denied_tools)
