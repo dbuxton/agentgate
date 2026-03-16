@@ -221,6 +221,71 @@ Key endpoints:
 - `POST /tokens/issue` — start a session
 - `GET /audit?user_id=...` — audit trail
 
+## MCP Server — agents that govern themselves
+
+agentgate v0.2.0 ships a **stdio MCP server** so your AI agents can query and participate in their own governance — in the protocol they already speak.
+
+```bash
+# Add to Claude Desktop config
+{
+  "mcpServers": {
+    "agentgate": {
+      "command": "agentgate-mcp",
+      "env": {
+        "AGENTGATE_DB": "/path/to/agentgate.db",
+        "AGENTGATE_SECRET": "your-secret"
+      }
+    }
+  }
+}
+```
+
+Available MCP tools:
+
+| Tool | What it does |
+|------|-------------|
+| `check_permission` | Pre-check whether a tool call is allowed (before executing) |
+| `list_my_permissions` | Introspect effective allowed/denied patterns, rate limits, quota |
+| `get_quota_status` | See remaining rate limit and daily token budget with progress bars |
+| `request_elevation` | Self-service access escalation — agent explains why it needs more access |
+
+### The feedback loop
+
+```
+Agent wants to call write_orders
+    │
+    ├─ check_permission("write_orders") → DENIED
+    │
+    ├─ request_elevation("write_orders", "Need to update order status for customer complaint")
+    │  └─ Returns: Request ID abc-123, status: pending
+    │
+    └─ Admin sees pending request in dashboard → approves via:
+       POST /elevation/abc-123/approve
+```
+
+Agents don't just get controlled by agentgate — they participate in their own governance. A 10x smarter model still can't know YOUR org's permission policy or YOUR company's approval workflow. That's a human policy problem, not an intelligence problem.
+
+## Elevation Requests
+
+Agents can request elevated access to tools they're not currently permitted to use.
+
+```bash
+# List pending requests
+curl localhost:8765/elevation?status=pending
+
+# Approve a request
+curl -X POST localhost:8765/elevation/{req_id}/approve \
+  -H 'Content-Type: application/json' \
+  -d '{"reviewed_by": "admin@acme.com"}'
+
+# Deny a request
+curl -X POST localhost:8765/elevation/{req_id}/deny \
+  -H 'Content-Type: application/json' \
+  -d '{"reviewed_by": "security@acme.com"}'
+```
+
+The dashboard shows a **Pending Elevations** count in the stats bar and a full elevation requests table with approve/deny API links.
+
 ## Python API
 
 ```python

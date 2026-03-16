@@ -122,6 +122,16 @@ class RevokeTokenRequest(BaseModel):
     token_id: str
 
 
+class CreateElevationRequest(BaseModel):
+    token: str
+    tool_name: str
+    reason: str
+
+
+class ReviewElevationRequest(BaseModel):
+    reviewed_by: Optional[str] = None
+
+
 class EnforceHTTPRequest(BaseModel):
     token: str
     tool_name: str
@@ -422,6 +432,84 @@ def get_usage(user_id: str):
     return db.get_usage_stats(user_id)
 
 
+# ── Elevation Requests ────────────────────────────────────────────────────────
+
+@app.get("/elevation")
+def list_elevation_requests(
+    status: Optional[str] = None,
+    user_id: Optional[str] = None,
+    limit: int = Query(50, le=200),
+):
+    """List elevation requests. Filter by status ('pending', 'approved', 'denied') or user_id."""
+    valid_statuses = ("pending", "approved", "denied")
+    if status and status not in valid_statuses:
+        raise HTTPException(400, f"status must be one of {valid_statuses}")
+    return db.list_elevation_requests(status=status, user_id=user_id, limit=limit)
+
+
+@app.post("/elevation", status_code=201)
+def create_elevation_request(req: CreateElevationRequest):
+    """
+    Create an elevation request via the REST API.
+    (Agents typically use the MCP tool; this endpoint is for direct API users.)
+    """
+    claims = tm.verify(req.token)
+    if not claims:
+        raise HTTPException(401, "Invalid or expired token")
+    user = db.get_user(claims["uid"])
+    if not user:
+        raise HTTPException(404, "User not found")
+    if len(req.reason) < 10:
+        raise HTTPException(400, "reason must be at least 10 characters")
+    elev = db.create_elevation_request(
+        user_id=user.id,
+        token_id=claims.get("tid", ""),
+        tool_name=req.tool_name,
+        reason=req.reason,
+    )
+    return elev
+
+
+@app.get("/elevation/{req_id}")
+def get_elevation_request(req_id: str):
+    elev = db.get_elevation_request(req_id)
+    if not elev:
+        raise HTTPException(404, "Elevation request not found")
+    user = db.get_user(elev["user_id"])
+    if user:
+        elev["user_name"] = user.name
+        elev["user_email"] = user.email
+    return elev
+
+
+@app.post("/elevation/{req_id}/approve")
+def approve_elevation(req_id: str, req: ReviewElevationRequest):
+    """Approve a pending elevation request."""
+    elev = db.get_elevation_request(req_id)
+    if not elev:
+        raise HTTPException(404, "Elevation request not found")
+    if elev["status"] != "pending":
+        raise HTTPException(400, f"Request is already {elev['status']}")
+    ok = db.update_elevation_status(req_id, "approved", reviewed_by=req.reviewed_by)
+    if not ok:
+        raise HTTPException(409, "Could not update — request may have been reviewed already")
+    return {**db.get_elevation_request(req_id), "message": "Elevation approved"}
+
+
+@app.post("/elevation/{req_id}/deny")
+def deny_elevation(req_id: str, req: ReviewElevationRequest):
+    """Deny a pending elevation request."""
+    elev = db.get_elevation_request(req_id)
+    if not elev:
+        raise HTTPException(404, "Elevation request not found")
+    if elev["status"] != "pending":
+        raise HTTPException(400, f"Request is already {elev['status']}")
+    ok = db.update_elevation_status(req_id, "denied", reviewed_by=req.reviewed_by)
+    if not ok:
+        raise HTTPException(409, "Could not update — request may have been reviewed already")
+    return {**db.get_elevation_request(req_id), "message": "Elevation denied"}
+
+
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
@@ -431,6 +519,7 @@ def dashboard():
     roles = db.list_roles()
     teams = db.list_teams()
     audit = db.get_audit_log(limit=20)
+    elevations = db.list_elevation_requests(limit=20)
 
     profile_map = {p.id: p.name for p in profiles}
     role_map = {r.id: r for r in roles}
@@ -517,6 +606,33 @@ def dashboard():
           <td>{verdict}</td>
         </tr>"""
 
+    user_map = {u.id: u for u in users}
+    pending_count = sum(1 for e in elevations if e["status"] == "pending")
+
+    rows_elevation = ""
+    for elev in elevations:
+        status = elev["status"]
+        if status == "pending":
+            status_html = '<span class="elev-pending">⏳ pending</span>'
+        elif status == "approved":
+            status_html = '<span class="active">✅ approved</span>'
+        else:
+            status_html = '<span class="revoked">✗ denied</span>'
+        u = user_map.get(elev["user_id"])
+        user_display = f"{u.name} ({u.email})" if u else elev["user_id"][:8]
+        reviewed_by = elev.get("reviewed_by") or "—"
+        reviewed_at = fmt_time(elev.get("reviewed_at"))
+        rows_elevation += f"""
+        <tr>
+          <td class="ts">{fmt_time(elev['created_at'])}</td>
+          <td>{user_display}</td>
+          <td><code>{elev['tool_name']}</code></td>
+          <td style="max-width:300px;font-size:12px;color:var(--muted)">{elev['reason']}</td>
+          <td>{status_html}</td>
+          <td class="ts">{reviewed_at}</td>
+          <td class="ts">{reviewed_by}</td>
+        </tr>"""
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -560,6 +676,8 @@ def dashboard():
   .team-tag {{ background: rgba(251,191,36,0.15); color: var(--yellow); }}
   .muted {{ color: var(--muted); }}
   .level {{ color: var(--yellow); }}
+  .elev-pending {{ color: var(--yellow); }}
+  .elev-badge {{ background: rgba(251,191,36,0.2); color: var(--yellow); border-radius: 12px; padding: 2px 8px; font-size: 11px; font-weight: 700; margin-left: 6px; }}
 </style>
 <script>setTimeout(()=>location.reload(), 60000)</script>
 </head>
@@ -578,6 +696,7 @@ def dashboard():
     <div class="stat"><div class="label">Teams</div><div class="value accent">{len(teams)}</div></div>
     <div class="stat"><div class="label">Roles</div><div class="value accent">{len(roles)}</div></div>
     <div class="stat"><div class="label">Profiles</div><div class="value accent">{len(profiles)}</div></div>
+    <div class="stat"><div class="label">Pending Elevations</div><div class="value {'red' if pending_count > 0 else 'muted'}">{pending_count}</div></div>
   </div>
 
   <section>
@@ -620,6 +739,23 @@ def dashboard():
         <th>Rate Limit</th><th>Token Quota</th>
       </tr></thead>
       <tbody>{rows_profiles}</tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Elevation Requests
+      {'<span class="elev-badge">' + str(pending_count) + ' pending</span>' if pending_count > 0 else ''}
+    </h2>
+    <p style="color:var(--muted);font-size:12px;margin-bottom:14px">
+      Agents request elevated access via MCP <code>request_elevation()</code> tool.
+      Approve or deny via <code>POST /elevation/{{id}}/approve</code> or <code>/deny</code>.
+    </p>
+    <table>
+      <thead><tr>
+        <th>Time</th><th>User</th><th>Tool Requested</th><th>Reason</th><th>Status</th>
+        <th>Reviewed</th><th>Reviewer</th>
+      </tr></thead>
+      <tbody>{rows_elevation if rows_elevation else '<tr><td colspan="7" style="color:var(--muted);text-align:center;padding:20px">No elevation requests yet — agents can request access via MCP <code>request_elevation()</code></td></tr>'}</tbody>
     </table>
   </section>
 

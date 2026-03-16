@@ -4,6 +4,7 @@ agentgate/__init__.py
 agentgate/cli.py
 agentgate/db.py
 agentgate/gate.py
+agentgate/mcp_server.py
 agentgate/models.py
 agentgate/server.py
 agentgate/tokens.py
@@ -17,3 +18,5 @@ agentgate/integrations/__init__.py
 agentgate/integrations/django_adapter.py
 agentgate/integrations/openai_wrapper.py
 tests/test_agentgate.py
+tests/test_elevation.py
+tests/test_mcp.py

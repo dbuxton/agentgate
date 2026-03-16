@@ -131,12 +131,27 @@ class AgentGateDB:
                     PRIMARY KEY (team_id, user_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS elevation_requests (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL REFERENCES users(id),
+                    token_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    reviewed_at REAL,
+                    reviewed_by TEXT
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_tokens_user ON session_tokens(user_id);
                 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id);
                 CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_users_external ON users(external_id);
                 CREATE INDEX IF NOT EXISTS idx_team_members_user ON team_members(user_id);
                 CREATE INDEX IF NOT EXISTS idx_team_members_team ON team_members(team_id);
+                CREATE INDEX IF NOT EXISTS idx_elevation_status ON elevation_requests(status);
+                CREATE INDEX IF NOT EXISTS idx_elevation_user ON elevation_requests(user_id);
             """)
 
     # ── Profiles ─────────────────────────────────────────────────────────────
@@ -695,3 +710,115 @@ class AgentGateDB:
                 }
                 for row in rows
             }
+
+    def get_usage(self, user_id: str, window_key: str) -> int:
+        """Get tool_calls counter for a specific window key."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT tool_calls FROM usage_counters WHERE user_id=? AND window_key=?",
+                (user_id, window_key),
+            ).fetchone()
+            return row["tool_calls"] if row else 0
+
+    # ── Elevation Requests ─────────────────────────────────────────────────────
+
+    def create_elevation_request(
+        self,
+        user_id: str,
+        token_id: str,
+        tool_name: str,
+        reason: str,
+        ttl_seconds: int = 3600,
+    ) -> Dict[str, Any]:
+        """
+        Create a pending elevation request — an agent self-nominates for more access.
+
+        Requests expire after ttl_seconds (default 1 hour) if not reviewed.
+        Returns a dict representation of the created request.
+        """
+        req_id = str(uuid.uuid4())
+        now = time.time()
+        expires_at = now + ttl_seconds
+
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO elevation_requests
+                   (id, user_id, token_id, tool_name, reason, status, created_at, expires_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (req_id, user_id, token_id, tool_name, reason, "pending", now, expires_at),
+            )
+        return {
+            "id": req_id,
+            "user_id": user_id,
+            "token_id": token_id,
+            "tool_name": tool_name,
+            "reason": reason,
+            "status": "pending",
+            "created_at": now,
+            "expires_at": expires_at,
+            "reviewed_at": None,
+            "reviewed_by": None,
+        }
+
+    def get_elevation_request(self, req_id: str) -> Optional[Dict[str, Any]]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM elevation_requests WHERE id=?", (req_id,)
+            ).fetchone()
+            return self._row_to_elevation(row) if row else None
+
+    def list_elevation_requests(
+        self,
+        status: Optional[str] = None,
+        user_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        conditions = []
+        params: List[Any] = []
+        if status:
+            conditions.append("status=?")
+            params.append(status)
+        if user_id:
+            conditions.append("user_id=?")
+            params.append(user_id)
+        q = "SELECT * FROM elevation_requests"
+        if conditions:
+            q += " WHERE " + " AND ".join(conditions)
+        q += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        with self._conn() as conn:
+            rows = conn.execute(q, params).fetchall()
+            return [self._row_to_elevation(r) for r in rows]
+
+    def update_elevation_status(
+        self,
+        req_id: str,
+        status: str,
+        reviewed_by: Optional[str] = None,
+    ) -> bool:
+        """Set status to 'approved' or 'denied'. Returns True if updated."""
+        if status not in ("approved", "denied"):
+            raise ValueError("status must be 'approved' or 'denied'")
+        now = time.time()
+        with self._conn() as conn:
+            cur = conn.execute(
+                """UPDATE elevation_requests
+                   SET status=?, reviewed_at=?, reviewed_by=?
+                   WHERE id=? AND status='pending'""",
+                (status, now, reviewed_by, req_id),
+            )
+            return cur.rowcount > 0
+
+    def _row_to_elevation(self, row) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "user_id": row["user_id"],
+            "token_id": row["token_id"],
+            "tool_name": row["tool_name"],
+            "reason": row["reason"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "expires_at": row["expires_at"],
+            "reviewed_at": row["reviewed_at"],
+            "reviewed_by": row["reviewed_by"],
+        }
